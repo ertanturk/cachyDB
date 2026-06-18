@@ -15,7 +15,8 @@ class Record:
     MAX_KEY_SIZE: int = 4096  # 4KB
     MAX_VALUE_SIZE: int = 16 * 1024 * 1024  # 16MB
     MIN_KEY_SIZE: int = 1
-    MIN_VALUE_SIZE: int = 0
+    MIN_VALUE_SIZE: int = 0  # Note: encrypted values will be at least NONCE_SIZE + MAC_TAG_SIZE (28 bytes)
+    ENCRYPTION_KEY_SIZE: int = 32  # ChaCha20Poly1305 requires exactly 32 bytes
     RECORD_LENGTH_SIZE: int = 4
     MAGIC_VALUE_SIZE: int = 4
     KEY_LENGTH_SIZE: int = 4
@@ -25,6 +26,25 @@ class Record:
     MAC_TAG_SIZE: int = 16
     MIN_ENCRYPTED_SIZE: int = NONCE_SIZE + MAC_TAG_SIZE
     MIN_RECORD_SIZE: int = RECORD_LENGTH_SIZE + MAGIC_VALUE_SIZE + KEY_LENGTH_SIZE + VALUE_LENGTH_SIZE + CHECKSUM_SIZE
+
+    @staticmethod
+    def validate_encryption_key(encryption_key: bytes) -> None:
+        """Validates that encryption key is exactly 32 bytes for ChaCha20Poly1305.
+
+        Args:
+            encryption_key: The encryption key to validate.
+
+        Raises:
+            TypeError: If encryption_key is not bytes.
+            ValueError: If encryption_key is not exactly 32 bytes.
+        """
+        if not isinstance(encryption_key, bytes):
+            raise TypeError(f"Encryption key must be bytes, got {type(encryption_key).__name__}")
+        if len(encryption_key) != Record.ENCRYPTION_KEY_SIZE:
+            raise ValueError(
+                f"Encryption key must be exactly {Record.ENCRYPTION_KEY_SIZE} bytes for ChaCha20Poly1305, "
+                f"got {len(encryption_key)} bytes"
+            )
 
     @staticmethod
     def validate_key_length(key_length: int) -> None:
@@ -63,14 +83,19 @@ class Record:
         Args:
             key: The key as a string.
             value: The value to serialize as JSON.
+            encryption_key: 32-byte encryption key for ChaCha20Poly1305.
 
         Returns:
             Packed record bytes.
 
         Raises:
-            ValueError: If key or value exceeds size limits or key is empty.
+            TypeError: If encryption_key is not bytes.
+            ValueError: If key or value exceeds size limits, key is empty, or encryption_key is invalid.
             UnicodeEncodeError: If key cannot be encoded as UTF-8.
         """
+        # Validate encryption key first
+        Record.validate_encryption_key(encryption_key)
+
         key_bytes = key.encode("utf-8")
         value_json_str = json.dumps(value, sort_keys=True)
         raw_value_bytes = value_json_str.encode("utf-8")
@@ -97,6 +122,9 @@ class Record:
             + Record.VALUE_LENGTH_SIZE
             + Record.CHECKSUM_SIZE
         )
+        # Validate record length fits in 4 bytes (max 4GB)
+        if record_length > 0xFFFFFFFF:
+            raise ValueError(f"Record length {record_length} exceeds maximum allowed size of {0xFFFFFFFF} bytes (4GB)")
         record_length_bytes = record_length.to_bytes(Record.RECORD_LENGTH_SIZE, byteorder="big")
 
         checksum: int = Record.calculate_checksum(
@@ -150,19 +178,36 @@ class Record:
 
         Args:
             packed_record: Packed record bytes.
+            encryption_key: 32-byte encryption key for ChaCha20Poly1305.
 
         Returns:
             Tuple of (key, value).
 
         Raises:
-            ValueError: If record is malformed, corrupted, or data is invalid.
+            TypeError: If encryption_key is not bytes.
+            ValueError: If record is malformed, corrupted, encryption_key is invalid, or data is invalid.
         """
+        # Validate encryption key first
+        cls.validate_encryption_key(encryption_key)
+
         if len(packed_record) < cls.MIN_RECORD_SIZE:
             raise ValueError(
                 f"Incomplete record: expected at least {cls.MIN_RECORD_SIZE} bytes, got {len(packed_record)}"
             )
 
         record_length: int = int.from_bytes(packed_record[0 : cls.RECORD_LENGTH_SIZE], byteorder="big")
+
+        # Early security check for obviously invalid lengths
+        # This prevents buffer over-read attacks with extremely large claimed lengths
+        if record_length > 0x10000000:  # 256 MB sanity check
+            raise ValueError(
+                f"Invalid record length in header: 0x{record_length:08X} ({record_length} bytes) exceeds sanity limit"
+            )
+        if record_length < cls.MIN_RECORD_SIZE:
+            raise ValueError(
+                f"Invalid record length in header: 0x{record_length:08X} ({record_length} bytes), "
+                f"minimum is {cls.MIN_RECORD_SIZE} bytes"
+            )
 
         magic_value: int = int.from_bytes(
             packed_record[cls.RECORD_LENGTH_SIZE : cls.RECORD_LENGTH_SIZE + cls.MAGIC_VALUE_SIZE],
@@ -234,7 +279,10 @@ class Record:
             )
 
         if len(encrypted_value_bytes) < cls.MIN_ENCRYPTED_SIZE:
-            raise ValueError("Invalid encrypted value. Too short to contain nonce and ciphertext.")
+            raise ValueError(
+                f"Invalid encrypted value: expected at least {cls.MIN_ENCRYPTED_SIZE} bytes, "
+                f"got {len(encrypted_value_bytes)} bytes. Too short to contain nonce and MAC tag."
+            )
 
         nonce = encrypted_value_bytes[: cls.NONCE_SIZE]
         ciphertext = encrypted_value_bytes[cls.NONCE_SIZE :]
@@ -243,7 +291,8 @@ class Record:
         try:
             decrypted_value_bytes = chacha.decrypt(nonce, ciphertext, associated_data=None)
         except Exception as exc:
-            raise ValueError(f"Decryption failed: {exc}") from exc
+            # ChaCha20Poly1305.decrypt raises Exception on authentication failure
+            raise ValueError(f"Decryption failed (wrong key or corrupted data): {exc}") from exc
 
         try:
             value_str = decrypted_value_bytes.decode("utf-8")
@@ -255,7 +304,16 @@ class Record:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Corrupted JSON payload: {exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
 
-        if record_length != len(packed_record):
+        # Final validation: ensure we consumed exactly the expected record length
+        expected_end: int = checksum_offset + cls.CHECKSUM_SIZE
+        if expected_end != record_length:
+            raise ValueError(
+                f"Checksum mismatch in record structure: computed end position 0x{expected_end:08X} bytes, "
+                f"but header claims 0x{record_length:08X} bytes"
+            )
+
+        # Ensure packed_record matches the declared length exactly
+        if len(packed_record) != record_length:
             raise ValueError(
                 f"Record length mismatch: header claims {record_length} bytes, but received {len(packed_record)} bytes"
             )
