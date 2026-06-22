@@ -50,7 +50,7 @@ extend-select = [
     "FURB",
 ]
 
-ignore = ["E501", "UP035", "TC001", "SIM117"]
+ignore = ["E501", "UP035", "TC001", "SIM117", "UP028"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
