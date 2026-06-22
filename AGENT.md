@@ -45,7 +45,9 @@ Every function, method, and variable must have explicit type annotations.
 **Rules:**
 
 - Use `from typing import` for complex types (e.g., `Any`, `Union`, `Optional`, `Callable`)
-- Use logging for debugging and error messages instead of `print`
+- Use logging for debugging and error messages instead of `print` and write detailed log messages
+- Use english for log messages and comments
+- Before writing a function, write a docstring describing what the function does and its parameters/return type
 - Use modern type hint syntax: `list[T]` instead of `List[T]`, `tuple[T, ...]` instead of `Tuple[T, ...]`
 - Annotate all function parameters and return types
 - Annotate class variables with their types
@@ -419,6 +421,9 @@ except SpecificError as exc:
 - [ ] Code follows PEP 8 naming conventions
 - [ ] No bare `except` statements
 - [ ] No unused imports (ruff I)
+- [ ] No security vulnerabilities
+- [ ] No dry code and no copy-pasted logic
+- [ ] Check for logical errors and edge cases and bugs
 - [ ] Tests exist for new functionality
 - [ ] Tests pass with `pytest`
 - [ ] Code is deterministic (no random behavior unless documented)

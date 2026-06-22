@@ -165,6 +165,27 @@ class BTreeMemTable:
 
         self.size += 1
 
+    def contains(self, key: str) -> bool:
+        """Returns ``True`` if the tree holds an entry for ``key``.
+
+        Unlike :meth:`search`, which returns ``None`` for both a missing key
+        and a key whose value is ``None``, this method unambiguously reports
+        whether the key exists.
+
+        Args:
+            key: The key to check.  Must be a non-empty string.
+
+        Returns:
+            ``True`` if the key is present, ``False`` otherwise.
+
+        Raises:
+            TypeError: If ``key`` is not a string.
+            ValueError: If ``key`` is an empty string.
+        """
+        self._validate_key(key)
+        node, _ = self._find_node_and_index(self.root, key)
+        return node is not None
+
     def in_order_traversal(self) -> Iterator[tuple[str, Any]]:
         """Yields all ``(key, value)`` pairs in ascending key order.
 

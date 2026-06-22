@@ -9,6 +9,7 @@ authors = [
 ]
 dependencies = [
     "cryptography>=49.0.0",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]
