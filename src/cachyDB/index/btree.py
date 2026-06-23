@@ -7,6 +7,7 @@ It is intended as the primary index structure for the storage engine's memtable.
 
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,8 @@ class BTreeNode:
         children (list[BTreeNode]): Child node pointers for internal nodes.
             A node with ``n`` keys has exactly ``n + 1`` children.
     """
+
+    __slots__ = ("leaf", "keys", "values", "children")
 
     def __init__(self, leaf: bool = True) -> None:
         """Initializes an empty B-tree node.
@@ -215,7 +218,7 @@ class BTreeMemTable:
             TypeError: If ``key`` is not a ``str``.
             ValueError: If ``key`` is an empty string.
         """
-        if not isinstance(key, str):
+        if type(key) is not str:
             raise TypeError(f"key must be a str, got {type(key).__name__}.")
         if not key:
             raise ValueError("key must not be an empty string.")
@@ -230,18 +233,11 @@ class BTreeMemTable:
         Returns:
             The associated value if found, ``None`` otherwise.
         """
-        i: int = 0
-        n: int = len(node.keys)
-
-        while i < n and key > node.keys[i]:
-            i += 1
-
-        if i < n and key == node.keys[i]:
+        i: int = bisect.bisect_left(node.keys, key)
+        if i < len(node.keys) and key == node.keys[i]:
             return node.values[i]
-
         if node.leaf:
             return None
-
         return self._search(node.children[i], key)
 
     def _find_node_and_index(self, node: BTreeNode, key: str) -> tuple[BTreeNode | None, int]:
@@ -315,32 +311,16 @@ class BTreeMemTable:
             key: The key to insert.  Must not already exist in the subtree.
             value: The value to associate with ``key``.
         """
-        i: int = len(node.keys) - 1
-
         if node.leaf:
-            # Extend by one slot and shift keys right to make room for the
-            # new entry.  A non-empty placeholder is avoided here; instead
-            # we use a rightward shift pattern identical to insertion sort.
-            node.keys.append(node.keys[-1] if node.keys else key)
-            node.values.append(node.values[-1] if node.values else value)
-
-            while i >= 0 and key < node.keys[i]:
-                node.keys[i + 1] = node.keys[i]
-                node.values[i + 1] = node.values[i]
-                i -= 1
-
-            node.keys[i + 1] = key
-            node.values[i + 1] = value
+            i: int = bisect.bisect_left(node.keys, key)
+            node.keys.insert(i, key)
+            node.values.insert(i, value)
         else:
-            while i >= 0 and key < node.keys[i]:
-                i -= 1
-            i += 1
-
+            i: int = bisect.bisect_left(node.keys, key)
             if len(node.children[i].keys) == (2 * self.t) - 1:
                 self._split_child(node, i)
                 if key > node.keys[i]:
                     i += 1
-
             self._insert_non_full(node.children[i], key, value)
 
     def _in_order(self, node: BTreeNode) -> Iterator[tuple[str, Any]]:

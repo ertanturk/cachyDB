@@ -15,6 +15,9 @@ from __future__ import annotations
 import logging
 import struct
 import zlib
+from typing import Any
+
+from cachyDB.logger.structured_logger import OperationType, get_structured_logger
 
 
 class PageError(Exception):
@@ -98,8 +101,10 @@ class Pager:
         self.page_id: int = page_id
         self.flags: int = flags
         self.logger: logging.Logger = logging.getLogger(__name__)
+        self.structured_logger = get_structured_logger("pager")
         self.lower_offset: int = self.HEADER_SIZE
         self.upper_offset: int = self.PAGE_SIZE
+        self.cached_metadata: dict[int, Any] = {}
         self.slots: list[tuple[int, int]] = []
         self.data: bytearray = bytearray(self.PAGE_SIZE)
 
@@ -168,6 +173,20 @@ class Pager:
         self.slots.append((self.upper_offset, payload_len))
         self.lower_offset += self.SLOT_SIZE
         self.logger.debug(f"Inserted record of size {payload_len} into slot {slot_id} on page {self.page_id}.")
+        self.cached_metadata.clear()
+
+        # Log structured page write operation
+        trace_id: str = ""
+        latency_ms: float = 0.1  # Approximate for in-memory operation
+        self.structured_logger.log_write_operation(
+            trace_id=trace_id,
+            operation_type=OperationType.PAGE_WRITE,
+            table_name=f"page_{self.page_id}",
+            records_count=1,
+            data_size_bytes=payload_len,
+            latency_ms=latency_ms,
+            error_code=0,
+        )
         return slot_id
 
     def get_record(self, slot_id: int) -> bytes | None:
@@ -220,6 +239,7 @@ class Pager:
         self.data[offset : offset + length] = bytes(length)
         self.slots[slot_id] = (0, 0)
         self.logger.debug(f"Deleted record from slot {slot_id} on page {self.page_id}.")
+        self.cached_metadata.clear()
 
     def compact(self) -> None:
         """Reclaims fragmented space by repacking all active records.
@@ -250,6 +270,7 @@ class Pager:
         if free_size > 0:
             self.data[self.lower_offset : self.upper_offset] = bytes(free_size)
         self.logger.debug(f"Compacted page {self.page_id}, free space: {free_size} bytes.")
+        self.cached_metadata.clear()
 
     def to_bytes(self) -> bytes:
         """Serialises the page to a fixed-size ``bytes`` object with a CRC32 checksum.
@@ -283,6 +304,19 @@ class Pager:
         checksum: int = zlib.crc32(self.data) & 0xFFFFFFFF
         self.data[self.CHECKSUM_OFFSET : self.HEADER_SIZE] = struct.pack(self.CHECKSUM_FORMAT, checksum)
         self.logger.debug(f"Serialised page {self.page_id} with checksum {checksum}.")
+
+        # Log structured page read/serialization operation
+        trace_id: str = ""
+        latency_ms: float = 0.1  # Approximate for in-memory operation
+        self.structured_logger.log_write_operation(
+            trace_id=trace_id,
+            operation_type=OperationType.PAGE_READ,
+            table_name=f"page_{self.page_id}",
+            records_count=len(self.slots),
+            data_size_bytes=self.PAGE_SIZE,
+            latency_ms=latency_ms,
+            error_code=0,
+        )
         return bytes(self.data)
 
     @classmethod

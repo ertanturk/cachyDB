@@ -97,7 +97,7 @@ class Record:
         Record.validate_encryption_key(encryption_key)
 
         key_bytes = key.encode("utf-8")
-        value_json_str = json.dumps(value, sort_keys=True)
+        value_json_str = json.dumps(value)
         raw_value_bytes = value_json_str.encode("utf-8")
 
         nonce = os.urandom(Record.NONCE_SIZE)

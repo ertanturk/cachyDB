@@ -23,8 +23,9 @@ import gzip
 import json
 import logging
 import os
+import queue
 import shutil
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -88,32 +89,68 @@ class JsonFormatter(logging.Formatter):
 
 
 class CompressedRotatingFileHandler(RotatingFileHandler):
-    """A RotatingFileHandler that gzip-compresses rotated log files.
+    """A RotatingFileHandler that gzip-compresses every rotated backup.
 
-    After each rotation the rolled-over file (``<base>.1``) is compressed
-    to ``<base>.1.gz`` and the uncompressed copy is removed, keeping disk
-    usage proportional to ``backupCount`` × ``maxBytes`` rather than 2×.
+    Backups are kept as ``<base>.1.gz`` .. ``<base>.<backupCount>.gz`` instead
+    of the uncompressed ``<base>.1`` .. ``<base>.<backupCount>`` files that
+    :class:`~logging.handlers.RotatingFileHandler` produces, keeping disk
+    usage proportional to the *compressed* size rather than the raw size.
+
+    ``doRollover`` is a full override rather than a thin wrapper around
+    ``super().doRollover()``: the parent implementation shifts plain
+    ``<base>.N`` files (``.1`` -> ``.2`` -> ``.3`` ...). Since this handler
+    deletes the plain ``.1`` file immediately after compressing it, the
+    parent's rename chain would find nothing at ``.1`` on the *next*
+    rotation and silently fail to preserve older ``.gz`` backups, causing
+    every rotation to clobber the single most recent backup instead of
+    keeping ``backupCount`` of them.
 
     Inherits all parameters from :class:`~logging.handlers.RotatingFileHandler`.
     """
 
     def doRollover(self) -> None:
-        """Performs log rotation and compresses the rolled-over file.
+        """Performs log rotation, shifting and compressing backups.
 
-        Calls the parent rollover logic first, then compresses the
-        ``<base>.1`` backup file to ``<base>.1.gz``.
+        Shifts existing ``<base>.N.gz`` backups up by one index (``.4.gz``
+        -> ``.5.gz``, ``.3.gz`` -> ``.4.gz``, ...), then renames the active
+        log file to ``<base>.1`` and compresses it to ``<base>.1.gz``.
         """
-        super().doRollover()
-        rolled_file: Path = Path(str(self.baseFilename) + ".1")
-        if rolled_file.exists():
-            compressed_file: Path = rolled_file.with_suffix(".log.gz")
-            try:
-                with rolled_file.open("rb") as src, gzip.open(compressed_file, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                rolled_file.unlink()
-            except OSError as exc:
-                # Non-fatal: leave the uncompressed file if compression fails.
-                logging.getLogger("cachyDB").warning("Failed to compress rotated log file '%s': %s", rolled_file, exc)
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        base_path: Path = Path(self.baseFilename)
+
+        if self.backupCount > 0:
+            for index in range(self.backupCount - 1, 0, -1):
+                source: Path = base_path.with_name(f"{base_path.name}.{index}.gz")
+                destination: Path = base_path.with_name(f"{base_path.name}.{index + 1}.gz")
+                if source.exists():
+                    if destination.exists():
+                        destination.unlink()
+                    source.rename(destination)
+
+            first_backup: Path = base_path.with_name(f"{base_path.name}.1")
+            first_backup_gz: Path = base_path.with_name(f"{base_path.name}.1.gz")
+
+            if first_backup.exists():
+                first_backup.unlink()
+            if base_path.exists():
+                base_path.rename(first_backup)
+
+            if first_backup.exists():
+                try:
+                    with first_backup.open("rb") as src, gzip.open(first_backup_gz, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    first_backup.unlink()
+                except OSError as exc:
+                    # Non-fatal: leave the uncompressed file if compression fails.
+                    logging.getLogger("cachyDB").warning(
+                        "Failed to compress rotated log file '%s': %s", first_backup, exc
+                    )
+
+        if not self.delay:
+            self.stream = self._open()
 
 
 class LogHandler:
@@ -130,6 +167,11 @@ class LogHandler:
 
     All configuration can be overridden via environment variables; see
     module-level docstring for details.
+
+    Records are routed through a :class:`~logging.handlers.QueueHandler` /
+    :class:`~logging.handlers.QueueListener` pair so that I/O-bound handler
+    work (file writes, gzip compression) happens on a dedicated listener
+    thread rather than the caller's thread.
 
     Attributes:
         log_level (int): Logging level resolved from ``LOG_LEVEL`` env var.
@@ -150,6 +192,7 @@ class LogHandler:
     LOG_DIR_DEFAULT: str = "data/logs"
     LOG_BACKUP_COUNT: int = 5
     MAX_LOG_SIZE: int = 10_485_760  # 10 MB
+    LOG_QUEUE_MAX_SIZE: int = 0  # 0 = unbounded queue for high-throughput scenarios
 
     # File handler format — verbose for post-mortem debugging.
     LOG_FORMAT: str = (
@@ -193,8 +236,14 @@ class LogHandler:
         self.json_file_path: Path = self.log_dir / "cachyDB.json.log"
         self.json_logging_enabled: bool = os.environ.get("LOG_JSON", "false").strip().lower() in {"true", "1", "yes"}
 
+        self._handlers: list[logging.Handler] = []
+        self._listener: QueueListener | None = None
+
         try:
             self._create_log_dir()
+            # Use unbounded queue (maxsize=0) to handle high-throughput logging without dropping records
+            # This prevents queue.Full exceptions during stress testing or high concurrent load
+            self._queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=self.LOG_QUEUE_MAX_SIZE)
             self._setup_logging()
         except Exception as exc:
             raise LoggingHandlerError(f"Failed to configure logging: {exc}") from exc
@@ -225,8 +274,12 @@ class LogHandler:
         """Creates the log directory and log files on disk if they do not exist.
 
         The log directory receives ``0o700`` permissions (owner
-        read/write/execute only).  Each log file receives ``0o600``
-        permissions (owner read/write only) on first creation.
+        read/write/execute only). Each log file receives ``0o600``
+        permissions (owner read/write only). Files are created with
+        :func:`os.open` using an explicit mode (rather than ``touch()``
+        followed by a separate ``chmod()``) to avoid a race window where
+        the file would briefly exist with default, umask-derived
+        permissions before being locked down.
 
         Raises:
             LoggingHandlerError: If the directory or any log file cannot be created.
@@ -239,9 +292,14 @@ class LogHandler:
 
         for log_file in (self.file_path, self.json_file_path):
             try:
-                if not log_file.exists():
-                    log_file.touch()
+                if log_file.exists():
                     log_file.chmod(0o600)
+                else:
+                    fd: int = os.open(log_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    os.close(fd)
+            except FileExistsError:
+                # Created concurrently by another process/thread; just re-assert permissions.
+                log_file.chmod(0o600)
             except OSError as exc:
                 raise LoggingHandlerError(f"Failed to create log file '{log_file}': {exc}") from exc
 
@@ -309,25 +367,38 @@ class LogHandler:
         """Attaches all configured handlers to the ``cachyDB`` named logger.
 
         Uses the ``cachyDB`` named logger rather than the root logger to
-        avoid interfering with other libraries.  ``propagate`` is set to
-        ``False`` for the same reason.  Any pre-existing handlers are cleared
+        avoid interfering with other libraries. ``propagate`` is set to
+        ``False`` for the same reason. Any pre-existing handlers are cleared
         before attachment to prevent duplicates on reconfiguration.
+
+        The underlying file/JSON/console handlers are driven by a
+        :class:`~logging.handlers.QueueListener` (started with
+        ``respect_handler_level=True`` so that each handler's own level,
+        e.g. the console handler's ``LOG_LEVEL`` filter, is actually
+        honored instead of every record reaching every handler).
 
         Raises:
             OSError: If any log file cannot be opened by its handler.
         """
+        handlers: list[logging.Handler] = [self._build_file_handler(), self._build_console_handler()]
+        if self.json_logging_enabled:
+            handlers.append(self._build_json_handler())
+
+        self._handlers = handlers
+
+        # Start the QueueListener: it consumes from the queue on a dedicated
+        # thread and dispatches each record to the real handlers, so that
+        # slow I/O (file writes, gzip compression) never blocks callers.
+        self._listener = QueueListener(self._queue, *handlers, respect_handler_level=True)
+        self._listener.start()
+
         logger: logging.Logger = logging.getLogger("cachyDB")
-        logger.setLevel(logging.DEBUG)  # Handlers control their own levels.
+        logger.setLevel(self.log_level)  # Logger controls overall level; handlers filter under it.
 
         if logger.handlers:
             logger.handlers.clear()
 
-        logger.addHandler(self._build_file_handler())
-        logger.addHandler(self._build_console_handler())
-
-        if self.json_logging_enabled:
-            logger.addHandler(self._build_json_handler())
-
+        logger.addHandler(QueueHandler(self._queue))
         logger.propagate = False
 
         logger.info(
@@ -338,15 +409,35 @@ class LogHandler:
         )
 
     def _shutdown(self) -> None:
-        """Flushes and closes all handlers attached to the ``cachyDB`` logger.
+        """Flushes and closes all logging resources on interpreter exit.
 
-        Registered with :func:`atexit` so that buffered records are not lost
-        when the interpreter exits normally.
+        Stops the :class:`~logging.handlers.QueueListener` first (so the
+        listener thread is no longer dispatching to handlers), then
+        explicitly flushes and closes every real handler (file, JSON,
+        console) followed by the ``QueueHandler`` attached to the logger.
+        Each step is isolated so a failure in one handler does not prevent
+        cleanup of the others.
+
+        Registered with :func:`atexit` so that buffered records are not
+        lost when the interpreter exits normally.
         """
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup, must not raise
+                logging.getLogger("cachyDB").debug("Error stopping queue listener: %s", exc)
+
+        for handler in self._handlers:
+            try:
+                handler.flush()
+                handler.close()
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup, must not raise
+                logging.getLogger("cachyDB").debug("Error closing handler '%s': %s", handler, exc)
+
         logger: logging.Logger = logging.getLogger("cachyDB")
         for handler in logger.handlers:
             try:
                 handler.flush()
                 handler.close()
-            except Exception:  # noqa: BLE001 — best-effort cleanup, must not raise
-                pass
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup, must not raise
+                logging.getLogger("cachyDB").debug("Error closing logger handler '%s': %s", handler, exc)

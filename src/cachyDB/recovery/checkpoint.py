@@ -109,6 +109,11 @@ class WALCheckpoint:
         newest) are considered. Files with unparseable names are skipped with a
         warning rather than aborting the entire checkpoint cycle.
         """
+
+        if getattr(self.wal, "active_flushes", 0) > 0:
+            self.logger.debug("Skipping checkpoint: Router is currently flushing MemTables.")
+            return
+
         wal_dir: Path = Path(self.wal.WAL_FILE_PATH)
         if not wal_dir.exists():
             return

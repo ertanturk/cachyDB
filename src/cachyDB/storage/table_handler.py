@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import IO
 
@@ -71,6 +72,8 @@ class TableHandler:
         _dir: Path = Path(tables_dir) if tables_dir is not None else Path(self.TABLES_DIR)
         self.file_path: Path = _dir / f"{table_name}.cachy"
         self.logger: logging.Logger = logging.getLogger(__name__)
+        self._lock: threading.RLock = threading.RLock()
+        self._page_cache: dict[int, Pager] = {}
 
         # Initialize to None before create_table() so close() is always safe
         # even when __init__ raises partway through.
@@ -117,10 +120,11 @@ class TableHandler:
         Raises:
             TableHandlerError: If the file is not open.
         """
-        self.require_open()
-        self.file.seek(0, os.SEEK_END)  # ty: ignore[unresolved-attribute]
-        file_size: int = self.file.tell()  # ty: ignore[unresolved-attribute]
-        return file_size // self.PAGE_SIZE
+        with self._lock:
+            self.require_open()
+            self.file.seek(0, os.SEEK_END)  # ty: ignore[unresolved-attribute]
+            file_size: int = self.file.tell()  # ty: ignore[unresolved-attribute]
+            return file_size // self.PAGE_SIZE
 
     def allocate_page(self) -> int:
         """Appends a new empty page to the table file and returns its page ID.
@@ -136,14 +140,15 @@ class TableHandler:
         Raises:
             TableHandlerError: If the file is not open.
         """
-        self.require_open()
-        new_page_id: int = self.total_pages
-        page: Pager = Pager(page_id=new_page_id)
-        self.file.seek(new_page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
-        self.file.write(page.to_bytes())  # ty: ignore[unresolved-attribute]
-        self.file.flush()  # ty: ignore[unresolved-attribute]
-        self.logger.debug(f"Allocated page {new_page_id}.")
-        return new_page_id
+        with self._lock:
+            self.require_open()
+            new_page_id: int = self.total_pages
+            page: Pager = Pager(page_id=new_page_id)
+            self._page_cache[new_page_id] = page
+            self.file.seek(new_page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
+            self.file.write(page.to_bytes())  # ty: ignore[unresolved-attribute]
+            self.logger.debug(f"Allocated page {new_page_id}.")
+            return new_page_id
 
     def read_page(self, page_id: int) -> Pager:
         """Reads and deserialises a page from the table file.
@@ -160,31 +165,36 @@ class TableHandler:
             TableHandlerError: If the file is not open, ``page_id`` is out of
                 range, the page data is truncated, or the page is corrupt.
         """
-        self.require_open()
-        if page_id < 0:
-            raise ValueError(f"page_id must be >= 0, got {page_id}.")
+        with self._lock:
+            self.require_open()
+            if page_id < 0:
+                raise ValueError(f"page_id must be >= 0, got {page_id}.")
 
-        total: int = self.total_pages
-        if page_id >= total:
-            raise TableHandlerError(
-                f"Page ID {page_id} is out of range: table '{self.table_name}' has {total} page(s)."
-            )
+            if page_id in self._page_cache:
+                return self._page_cache[page_id]
 
-        self.file.seek(page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
-        raw_data: bytes = self.file.read(self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
-        if len(raw_data) != self.PAGE_SIZE:
-            raise TableHandlerError(
-                f"Page {page_id} in table '{self.table_name}' is truncated: "
-                f"expected {self.PAGE_SIZE} bytes, read {len(raw_data)}."
-            )
-        try:
-            page = Pager.from_bytes(raw_data)
-            self.logger.debug(f"Deserialised page {page_id}.")
-            return page
-        except PageError as exc:
-            raise TableHandlerError(
-                f"Failed to deserialise page {page_id} in table '{self.table_name}': {exc}"
-            ) from exc
+            total: int = self.total_pages
+            if page_id >= total:
+                raise TableHandlerError(
+                    f"Page ID {page_id} is out of range: table '{self.table_name}' has {total} page(s)."
+                )
+
+            self.file.seek(page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
+            raw_data: bytes = self.file.read(self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
+            if len(raw_data) != self.PAGE_SIZE:
+                raise TableHandlerError(
+                    f"Page {page_id} in table '{self.table_name}' is truncated: "
+                    f"expected {self.PAGE_SIZE} bytes, read {len(raw_data)}."
+                )
+            try:
+                page = Pager.from_bytes(raw_data)
+                self.logger.debug(f"Deserialised page {page_id}.")
+                self._page_cache[page_id] = page
+                return page
+            except PageError as exc:
+                raise TableHandlerError(
+                    f"Failed to deserialise page {page_id} in table '{self.table_name}': {exc}"
+                ) from exc
 
     def write_page(self, page: Pager) -> None:
         """Serialises and writes a page to its position in the table file.
@@ -199,16 +209,17 @@ class TableHandler:
             TableHandlerError: If the file is not open or ``page.page_id``
                 has not yet been allocated.
         """
-        self.require_open()
-        total: int = self.total_pages
-        if page.page_id >= total:
-            raise TableHandlerError(
-                f"Page ID {page.page_id} is out of range: table '{self.table_name}' has {total} page(s)."
-            )
-        self.file.seek(page.page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
-        self.file.write(page.to_bytes())  # ty: ignore[unresolved-attribute]
-        self.file.flush()  # ty: ignore[unresolved-attribute]
-        self.logger.debug(f"Written page {page.page_id}.")
+        with self._lock:
+            self.require_open()
+            total: int = self.total_pages
+            if page.page_id >= total:
+                raise TableHandlerError(
+                    f"Page ID {page.page_id} is out of range: table '{self.table_name}' has {total} page(s)."
+                )
+            self._page_cache[page.page_id] = page
+            self.file.seek(page.page_id * self.PAGE_SIZE)  # ty: ignore[unresolved-attribute]
+            self.file.write(page.to_bytes())  # ty: ignore[unresolved-attribute]
+            self.logger.debug(f"Written page {page.page_id}.")
 
     def close(self) -> None:
         """Flushes, syncs, and closes the underlying table file.
@@ -216,11 +227,34 @@ class TableHandler:
         Safe to call even if the file was never successfully opened or has
         already been closed; subsequent calls are a no-op.
         """
-        if self.file is not None and not self.file.closed:
-            self.file.flush()
-            os.fsync(self.file.fileno())
-            self.file.close()
-            self.logger.debug(f"Closed table file '{self.file_path}'.")
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                getattr(self, "_page_cache", {}).clear()
+                if self.file is not None and not self.file.closed:
+                    self.file.flush()
+                    os.fsync(self.file.fileno())
+                    self.file.close()
+                    self.logger.debug(f"Closed table file '{self.file_path}'.")
+        else:
+            getattr(self, "_page_cache", {}).clear()
+            if self.file is not None and not self.file.closed:
+                self.file.flush()
+                os.fsync(self.file.fileno())
+                self.file.close()
+                self.logger.debug(f"Closed table file '{self.file_path}'.")
+
+    def sync(self) -> None:
+        """Forces the operating system to write file buffers to physical disk.
+
+        Raises:
+            TableHandlerError: If the file is not open.
+        """
+        with self._lock:
+            self.require_open()
+            self.file.flush()  # ty: ignore[unresolved-attribute]
+            os.fsync(self.file.fileno())  # ty: ignore[unresolved-attribute]
+            self.logger.debug(f"Synced table file '{self.file_path}' to physical disk.")
 
     def require_open(self) -> None:
         """Raises TableHandlerError if the file handle is not currently open.
